@@ -1,3 +1,4 @@
+import json
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 from fastapi import HTTPException
@@ -7,9 +8,12 @@ from pathlib import Path
 
 def _init_app():
     if not firebase_admin._apps:
-        BASE_DIR = Path(__file__).resolve().parent.parent.parent
-        cert_path = BASE_DIR / settings.FIREBASE_SERVICE_ACCOUNT_PATH
-        cred = credentials.Certificate(str(cert_path))
+        if settings.FIREBASE_SERVICE_ACCOUNT_JSON:
+            cred = credentials.Certificate(json.loads(settings.FIREBASE_SERVICE_ACCOUNT_JSON))
+        else:
+            BASE_DIR = Path(__file__).resolve().parent.parent.parent
+            cert_path = BASE_DIR / settings.FIREBASE_SERVICE_ACCOUNT_PATH
+            cred = credentials.Certificate(str(cert_path))
         firebase_admin.initialize_app(cred)
 
 
