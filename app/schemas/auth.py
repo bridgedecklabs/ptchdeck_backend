@@ -29,8 +29,17 @@ class InviteRequest(BaseModel):
 
 class AcceptInviteRequest(BaseModel):
     token: str
-    firebase_uid: str
-    full_name: str
+    # Option A — email/password
+    full_name: Optional[str] = None
+    password: Optional[str] = None
+    # Option B — Google / existing Firebase session
+    firebase_token: Optional[str] = None
+
+
+class InviteInfoResponse(BaseModel):
+    firm_name: str
+    role: str
+    email: str
 
 
 # ─── Response Models ──────────────────────────────────────────

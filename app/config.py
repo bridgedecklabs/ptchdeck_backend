@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     FIREBASE_SERVICE_ACCOUNT_PATH: str = "firebase_service_account.json"
     FIREBASE_SERVICE_ACCOUNT_JSON: str = ""  # JSON string for production (no file needed)
 
+    RESEND_API_KEY: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"
