@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Security, Depends
+from fastapi import APIRouter, HTTPException, Security, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.services.supabase_client import supabase
 from app.services.firebase_admin import verify_token
@@ -11,8 +11,11 @@ from app.schemas.auth import (
     AuthResponse,
     NeedsCompanyResponse,
     MessageResponse,
+    InviteInfoResponse,
 )
+from app.config import settings
 import secrets
+import resend
 from datetime import datetime, timezone, timedelta
 
 router = APIRouter()
@@ -124,6 +127,33 @@ def _get_auth_response_by_uid(firebase_uid: str) -> dict:
     return _build_auth_response(user, member, firm, perms_res.data)
 
 
+def _send_invite_email(to_email: str, invite_token: str) -> None:
+    resend.api_key = settings.RESEND_API_KEY
+    invite_link = f"https://ptchdeck.com/invite?token={invite_token}"
+    html = f"""
+    <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+      <h2 style="color:#1a1a1a">You've been invited to PtchDeck</h2>
+      <p>Someone from your team has invited you to join their workspace on PtchDeck.</p>
+      <p style="margin:32px 0">
+        <a href="{invite_link}"
+           style="background:#000;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600">
+          Accept Invite
+        </a>
+      </p>
+      <p style="color:#888;font-size:13px">
+        This link expires in 48 hours.<br>
+        If you didn't expect this invite, you can ignore this email.
+      </p>
+    </div>
+    """
+    resend.Emails.send({
+        "from": "PtchDeck <noreply@ptchdeck.com>",
+        "to": [to_email],
+        "subject": "You've been invited to PtchDeck",
+        "html": html,
+    })
+
+
 # ─── Routes ───────────────────────────────────────────────────
 
 @router.post("/auth/register", response_model=AuthResponse)
@@ -168,10 +198,8 @@ async def google_auth(body: GoogleAuthRequest):
             .execute()
 
         if existing.data:
-            # Existing user — just log them in
             return _get_auth_response_by_uid(body.firebase_uid)
 
-        # New user — needs company name before firm can be created
         return NeedsCompanyResponse(
             needs_company=True,
             firebase_uid=body.firebase_uid,
@@ -192,7 +220,6 @@ async def complete_profile(body: CompleteProfileRequest):
     Creates firm and owner membership.
     """
     try:
-        # Safety check — don't create duplicate
         existing = supabase.table("users") \
             .select("*") \
             .eq("firebase_uid", body.firebase_uid) \
@@ -200,9 +227,6 @@ async def complete_profile(body: CompleteProfileRequest):
         if existing.data:
             return _get_auth_response_by_uid(body.firebase_uid)
 
-        # We need user info — get it from Firebase token check
-        # firebase_uid is trusted here as it came from a verified Google session
-        # full_name and email must be fetched from Firebase
         import firebase_admin.auth as fb_auth
         firebase_user = fb_auth.get_user(body.firebase_uid)
 
@@ -234,27 +258,25 @@ async def get_me(credentials: HTTPAuthorizationCredentials = Security(security))
         raise HTTPException(status_code=500, detail=f"Failed to fetch user: {str(e)}")
 
 
+# ─── Invite Flow ───────────────────────────────────────────────
+
 @router.post("/auth/invite", response_model=MessageResponse)
 async def invite_member(
     body: InviteRequest,
     credentials: HTTPAuthorizationCredentials = Security(security),
 ):
-    """
-    Owner or Admin invites a new member by email.
-    Generates a signed token and sends invite email.
-    """
+    """Owner or Admin invites a new member by email."""
     try:
-        # Verify caller
         firebase_uid = verify_token(credentials.credentials)
-        caller = supabase.table("users") \
+
+        caller_res = supabase.table("users") \
             .select("id") \
             .eq("firebase_uid", firebase_uid) \
             .execute()
-        if not caller.data:
+        if not caller_res.data:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        caller_id = caller.data[0]["id"]
+        caller_id = caller_res.data[0]["id"]
 
-        # Get caller's firm and role
         caller_member = supabase.table("firm_members") \
             .select("firm_id, role") \
             .eq("user_id", caller_id) \
@@ -262,41 +284,44 @@ async def invite_member(
             .execute()
         if not caller_member.data:
             raise HTTPException(status_code=403, detail="No active membership")
+
         caller_role = caller_member.data[0]["role"]
         firm_id = caller_member.data[0]["firm_id"]
 
-        # Only owner and admin can invite
         if caller_role not in ("owner", "admin"):
             raise HTTPException(status_code=403, detail="Not authorized to invite")
 
-        # Role being assigned must be admin or user only
         if body.role not in ("admin", "user"):
-            raise HTTPException(status_code=400, detail="Invalid role. Must be admin or user")
+            raise HTTPException(status_code=400, detail="Role must be admin or user")
 
-        # Check if already a member
-        already = supabase.table("firm_members") \
-            .select("id") \
-            .eq("firm_id", firm_id) \
-            .execute()
-        # Get user by email first
-        invited_user = supabase.table("users") \
+        # Check active member with that email already in firm
+        existing_user = supabase.table("users") \
             .select("id") \
             .eq("email", body.email) \
             .execute()
-        if invited_user.data:
-            existing_member = supabase.table("firm_members") \
+        if existing_user.data:
+            active_check = supabase.table("firm_members") \
                 .select("id") \
                 .eq("firm_id", firm_id) \
-                .eq("user_id", invited_user.data[0]["id"]) \
+                .eq("user_id", existing_user.data[0]["id"]) \
+                .eq("status", "active") \
                 .execute()
-            if existing_member.data:
+            if active_check.data:
                 raise HTTPException(status_code=400, detail="User is already a member of this firm")
 
-        # Generate invite token
+        # Check pending invite for same email already exists
+        pending_check = supabase.table("firm_members") \
+            .select("id") \
+            .eq("firm_id", firm_id) \
+            .eq("invite_email", body.email) \
+            .eq("status", "pending") \
+            .execute()
+        if pending_check.data:
+            raise HTTPException(status_code=400, detail="An invite for this email is already pending")
+
         token = secrets.token_urlsafe(32)
         expires_at = datetime.now(timezone.utc) + timedelta(hours=INVITE_EXPIRE_HOURS)
 
-        # Store pending invite
         supabase.table("firm_members").insert({
             "firm_id": firm_id,
             "invited_by": caller_id,
@@ -307,9 +332,7 @@ async def invite_member(
             "invite_expires_at": expires_at.isoformat(),
         }).execute()
 
-        # TODO: Send invite email via email_service
-        # invite_link = f"https://app.ptchdeck.com/invite/accept?token={token}"
-        # await email_service.send_invite(to=body.email, firm_name=firm_name, link=invite_link)
+        _send_invite_email(to_email=body.email, invite_token=token)
 
         return {"message": f"Invite sent to {body.email}"}
 
@@ -319,15 +342,61 @@ async def invite_member(
         raise HTTPException(status_code=500, detail=f"Invite failed: {str(e)}")
 
 
+@router.get("/auth/invite/{token}", response_model=InviteInfoResponse)
+async def get_invite_info(token: str, response: Response):
+    """Returns firm name, role, and email for a valid pending invite."""
+    try:
+        invite_res = supabase.table("firm_members") \
+            .select("invite_email, firm_id, role, invite_expires_at") \
+            .eq("invite_token", token) \
+            .eq("status", "pending") \
+            .execute()
+
+        if not invite_res.data:
+            raise HTTPException(status_code=404, detail="Invalid invite token")
+
+        invite = invite_res.data[0]
+        expires_at = datetime.fromisoformat(invite["invite_expires_at"])
+
+        if datetime.now(timezone.utc) > expires_at:
+            response.status_code = 410
+            raise HTTPException(status_code=410, detail="Invite link has expired")
+
+        firm_res = supabase.table("firms") \
+            .select("name") \
+            .eq("id", invite["firm_id"]) \
+            .execute()
+
+        firm_name = firm_res.data[0]["name"] if firm_res.data else ""
+        return {
+            "firm_name": firm_name,
+            "role": invite["role"],
+            "email": invite["invite_email"],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get invite info: {str(e)}")
+
+
 @router.post("/auth/invite/accept", response_model=AuthResponse)
 async def accept_invite(body: AcceptInviteRequest):
     """
-    Invitee accepts invite.
-    Firebase account already created on frontend before calling this.
-    Token is validated, membership activated.
+    Accept an invite.
+    Option A — { token, full_name, password }: creates Firebase account server-side.
+    Option B — { token, firebase_token }: verifies existing Firebase session.
     """
     try:
-        # Find pending invite by token
+        # Validate exactly one auth method is provided
+        is_option_a = body.password is not None
+        is_option_b = body.firebase_token is not None
+        if not is_option_a and not is_option_b:
+            raise HTTPException(status_code=400, detail="Provide either password (Option A) or firebase_token (Option B)")
+        if is_option_a and is_option_b:
+            raise HTTPException(status_code=400, detail="Provide only one of password or firebase_token, not both")
+
+        # Find and validate invite
         invite_res = supabase.table("firm_members") \
             .select("*") \
             .eq("invite_token", body.token) \
@@ -338,30 +407,59 @@ async def accept_invite(body: AcceptInviteRequest):
             raise HTTPException(status_code=404, detail="Invalid or already used invite")
         invite = invite_res.data[0]
 
-        # Check expiry
         expires_at = datetime.fromisoformat(invite["invite_expires_at"])
         if datetime.now(timezone.utc) > expires_at:
-            raise HTTPException(status_code=400, detail="Invite link has expired")
+            raise HTTPException(status_code=410, detail="Invite link has expired")
 
-        # Verify email matches
+        invite_email = invite["invite_email"]
+
         import firebase_admin.auth as fb_auth
-        firebase_user = fb_auth.get_user(body.firebase_uid)
-        if firebase_user.email.lower() != invite["invite_email"].lower():
-            raise HTTPException(status_code=403, detail="Email does not match invite")
 
-        # Create or get user
+        if is_option_a:
+            # Create Firebase account server-side then get the uid
+            if not body.full_name:
+                raise HTTPException(status_code=400, detail="full_name is required for email/password signup")
+            try:
+                fb_user = fb_auth.create_user(
+                    email=invite_email,
+                    password=body.password,
+                    display_name=body.full_name,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Firebase account creation failed: {str(e)}")
+
+            firebase_uid = fb_user.uid
+            email = invite_email
+            full_name = body.full_name
+
+        else:
+            # Verify the Firebase ID token from the frontend
+            try:
+                decoded = fb_auth.verify_id_token(body.firebase_token)
+            except Exception:
+                raise HTTPException(status_code=401, detail="Invalid Firebase token")
+
+            firebase_uid = decoded["uid"]
+            fb_user = fb_auth.get_user(firebase_uid)
+            email = fb_user.email or decoded.get("email", "")
+            full_name = fb_user.display_name or decoded.get("name", "")
+
+            if email.lower() != invite_email.lower():
+                raise HTTPException(status_code=403, detail="Google account email does not match the invite")
+
+        # Create or fetch Supabase user
         existing_user = supabase.table("users") \
             .select("*") \
-            .eq("firebase_uid", body.firebase_uid) \
+            .eq("firebase_uid", firebase_uid) \
             .execute()
 
         if existing_user.data:
             user = existing_user.data[0]
         else:
             user_res = supabase.table("users").insert({
-                "firebase_uid": body.firebase_uid,
-                "email": firebase_user.email,
-                "full_name": body.full_name or firebase_user.display_name or "",
+                "firebase_uid": firebase_uid,
+                "email": email,
+                "full_name": full_name,
             }).execute()
             user = user_res.data[0]
 
