@@ -6,3 +6,4 @@ pydantic-settings>=2.5.0
 email-validator>=2.2.0
 supabase
 firebase-admin
+resend==2.29.0
