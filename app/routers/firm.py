@@ -12,7 +12,7 @@ class UpdateRoleRequest(BaseModel):
 
 class UpdatePermissionRequest(BaseModel):
     module: str
-    user_access: bool
+    enabled: bool
 
 
 # ─── Get all firm members ──────────────────────────────────────
@@ -168,22 +168,30 @@ async def remove_member(
 
 # ─── Get firm permissions ──────────────────────────────────────
 
+VALID_MODULES = [
+    "dashboard", "upload_queue", "scoreboard", "pipeline",
+    "portfolio", "cohort_builder", "connectors",
+    "manage_access", "billing", "settings",
+]
+
 @router.get("/firm/permissions")
 async def get_permissions(ctx=Depends(admin_and_above)):
     """
-    Returns all module permissions for the firm.
+    Returns module permissions for the firm as a flat object.
     Owner and Admin only.
     """
     try:
         firm_id = ctx["firm"]["id"]
 
-        perms_res = supabase.table("firm_permissions") \
-            .select("module, user_access") \
+        res = supabase.table("firm_permissions") \
+            .select(", ".join(VALID_MODULES)) \
             .eq("firm_id", firm_id) \
             .execute()
 
-        permissions = {p["module"]: p["user_access"] for p in perms_res.data}
-        return {"permissions": permissions}
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Permissions not found for this firm")
+
+        return res.data[0]
 
     except HTTPException:
         raise
@@ -199,29 +207,21 @@ async def update_permission(
     ctx=Depends(admin_and_above),
 ):
     """
-    Toggle a module on or off for User role.
+    Toggle a single module on or off.
     Owner and Admin only.
     """
     try:
         firm_id = ctx["firm"]["id"]
 
-        VALID_MODULES = [
-            "dashboard", "upload_queue", "scoreboard", "pipeline",
-            "portfolio", "cohort_builder", "connectors",
-            "manage_access", "billing", "settings"
-        ]
-
         if body.module not in VALID_MODULES:
             raise HTTPException(status_code=400, detail="Invalid module name")
 
-        # Update the permission
         supabase.table("firm_permissions") \
-            .update({"user_access": body.user_access}) \
+            .update({body.module: body.enabled}) \
             .eq("firm_id", firm_id) \
-            .eq("module", body.module) \
             .execute()
 
-        return {"message": f"{body.module} access set to {body.user_access}"}
+        return {"module": body.module, "enabled": body.enabled}
 
     except HTTPException:
         raise
