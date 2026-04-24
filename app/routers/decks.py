@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -34,6 +35,29 @@ async def upload_deck(
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File exceeds 25 MB limit")
 
+    file_hash = hashlib.sha256(contents).hexdigest()
+    try:
+        dup = (
+            supabase.table("decks")
+            .select("id, original_filename, uploaded_by")
+            .eq("firm_id", firm_id)
+            .eq("file_hash", file_hash)
+            .execute()
+        )
+        if dup.data:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "duplicate",
+                    "message": "This file was already uploaded",
+                    "existing_deck_id": dup.data[0]["id"],
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Duplicate check failed: {str(e)}")
+
     deck_id = str(uuid.uuid4())
     storage_path = f"{firm_id}/{deck_id}/original.{ext}"
 
@@ -55,6 +79,7 @@ async def upload_deck(
             "file_url": storage_path,
             "file_format": ext,
             "status": "queued",
+            "file_hash": file_hash,
         }).execute()
     except Exception as e:
         try:
