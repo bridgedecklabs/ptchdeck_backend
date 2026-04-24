@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -143,6 +144,32 @@ async def action_deck(
         }).eq("id", deck_id).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update deck: {str(e)}")
+
+    if body.action == "pipeline":
+        try:
+            inbox_res = (
+                supabase.table("pipeline_columns")
+                .select("id")
+                .eq("firm_id", firm_id)
+                .eq("is_fixed", True)
+                .limit(1)
+                .execute()
+            )
+            if inbox_res.data:
+                now = datetime.now(timezone.utc).isoformat()
+                supabase.table("kanban_cards").insert({
+                    "id": str(uuid.uuid4()),
+                    "deck_id": deck_id,
+                    "firm_id": firm_id,
+                    "column_id": inbox_res.data[0]["id"],
+                    "position": 0,
+                    "moved_by": ctx["user"]["id"],
+                    "moved_at": now,
+                    "entered_column_at": now,
+                    "final_status": "active",
+                }).execute()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create pipeline card: {str(e)}")
 
     return {"deck_id": deck_id, "scoreboard_status": body.action}
 
