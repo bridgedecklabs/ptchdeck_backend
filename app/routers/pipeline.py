@@ -220,6 +220,38 @@ async def finalize_card(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to update deck: {str(e)}")
 
+        return {"card_id": card_id, "final_status": body.action}
+
+    if body.action == "invested":
+        try:
+            deck_res = (
+                supabase.table("decks")
+                .select("company_name, sector, stage")
+                .eq("id", deck_id)
+                .execute()
+            )
+            deck = deck_res.data[0] if deck_res.data else {}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch deck: {str(e)}")
+
+        portfolio_id = str(uuid.uuid4())
+        try:
+            supabase.table("portfolio_companies").insert({
+                "id": portfolio_id,
+                "firm_id": firm_id,
+                "deck_id": deck_id,
+                "source": "pipeline",
+                "status": "draft",
+                "added_by": ctx["user"]["id"],
+                "company_name": deck.get("company_name") or "Unknown",
+                "sector": deck.get("sector"),
+                "stage_at_investment": deck.get("stage"),
+            }).execute()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create portfolio entry: {str(e)}")
+
+        return {"card_id": card_id, "final_status": "invested", "portfolio_id": portfolio_id}
+
     return {"card_id": card_id, "final_status": body.action}
 
 
