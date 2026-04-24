@@ -8,3 +8,4 @@ dist/
 build/
 .pytest_cache/
 firebase_service_account.json
+.claude

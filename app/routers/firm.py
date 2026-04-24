@@ -1,7 +1,13 @@
+import secrets
+from datetime import datetime, timezone, timedelta
+
 from fastapi import APIRouter, HTTPException, Depends
 from app.services.supabase_client import supabase
 from app.middleware.auth import admin_and_above, owner_only
+from app.services.email_service import send_invite_email
 from pydantic import BaseModel
+
+INVITE_EXPIRE_HOURS = 48
 
 router = APIRouter()
 
@@ -12,7 +18,7 @@ class UpdateRoleRequest(BaseModel):
 
 class UpdatePermissionRequest(BaseModel):
     module: str
-    user_access: bool
+    enabled: bool
 
 
 # ─── Get all firm members ──────────────────────────────────────
@@ -166,24 +172,112 @@ async def remove_member(
         raise HTTPException(status_code=500, detail=f"Failed to remove member: {str(e)}")
 
 
+# ─── Resend invite ─────────────────────────────────────────────
+
+@router.post("/firm/members/invite/{member_id}/resend")
+async def resend_invite(
+    member_id: str,
+    ctx=Depends(admin_and_above),
+):
+    firm_id = ctx["firm"]["id"]
+
+    try:
+        res = (
+            supabase.table("firm_members")
+            .select("id, invite_email")
+            .eq("id", member_id)
+            .eq("firm_id", firm_id)
+            .eq("status", "pending")
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Pending invite not found")
+
+    invite_email = res.data[0]["invite_email"]
+    new_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=INVITE_EXPIRE_HOURS)
+
+    try:
+        supabase.table("firm_members").update({
+            "invite_token": new_token,
+            "invite_expires_at": expires_at.isoformat(),
+        }).eq("id", member_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update invite: {str(e)}")
+
+    try:
+        send_invite_email(invite_email, new_token, ctx["firm"]["name"])
+    except Exception as e:
+        print(f"Resend invite email failed (token updated): {e}")
+
+    return {"success": True, "message": "Invite resent"}
+
+
+# ─── Cancel invite ─────────────────────────────────────────────
+
+@router.delete("/firm/members/invite/{member_id}")
+async def cancel_invite(
+    member_id: str,
+    ctx=Depends(admin_and_above),
+):
+    firm_id = ctx["firm"]["id"]
+
+    try:
+        res = (
+            supabase.table("firm_members")
+            .select("id")
+            .eq("id", member_id)
+            .eq("firm_id", firm_id)
+            .eq("status", "pending")
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Pending invite not found")
+
+    try:
+        supabase.table("firm_members").update({
+            "status": "cancelled",
+            "invite_token": None,
+            "invite_expires_at": None,
+        }).eq("id", member_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to cancel invite: {str(e)}")
+
+    return {"success": True, "message": "Invite cancelled"}
+
+
 # ─── Get firm permissions ──────────────────────────────────────
+
+VALID_MODULES = [
+    "dashboard", "upload_queue", "scoreboard", "pipeline",
+    "portfolio", "cohort_builder", "connectors",
+    "manage_access", "billing", "settings",
+]
 
 @router.get("/firm/permissions")
 async def get_permissions(ctx=Depends(admin_and_above)):
     """
-    Returns all module permissions for the firm.
+    Returns module permissions for the firm as a flat object.
     Owner and Admin only.
     """
     try:
         firm_id = ctx["firm"]["id"]
 
-        perms_res = supabase.table("firm_permissions") \
-            .select("module, user_access") \
+        res = supabase.table("firm_permissions") \
+            .select(", ".join(VALID_MODULES)) \
             .eq("firm_id", firm_id) \
             .execute()
 
-        permissions = {p["module"]: p["user_access"] for p in perms_res.data}
-        return {"permissions": permissions}
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Permissions not found for this firm")
+
+        return res.data[0]
 
     except HTTPException:
         raise
@@ -199,29 +293,21 @@ async def update_permission(
     ctx=Depends(admin_and_above),
 ):
     """
-    Toggle a module on or off for User role.
+    Toggle a single module on or off.
     Owner and Admin only.
     """
     try:
         firm_id = ctx["firm"]["id"]
 
-        VALID_MODULES = [
-            "dashboard", "upload_queue", "scoreboard", "pipeline",
-            "portfolio", "cohort_builder", "connectors",
-            "manage_access", "billing", "settings"
-        ]
-
         if body.module not in VALID_MODULES:
             raise HTTPException(status_code=400, detail="Invalid module name")
 
-        # Update the permission
         supabase.table("firm_permissions") \
-            .update({"user_access": body.user_access}) \
+            .update({body.module: body.enabled}) \
             .eq("firm_id", firm_id) \
-            .eq("module", body.module) \
             .execute()
 
-        return {"message": f"{body.module} access set to {body.user_access}"}
+        return {"module": body.module, "enabled": body.enabled}
 
     except HTTPException:
         raise

@@ -40,7 +40,8 @@ ALL_MODULES = [
 # ─── Helpers ──────────────────────────────────────────────────
 
 def _build_auth_response(user: dict, member: dict, firm: dict, perms_data: list) -> dict:
-    permissions = {p["module"]: p["user_access"] for p in perms_data}
+    row = perms_data[0] if perms_data else {}
+    permissions = {m: row.get(m, False) for m in ALL_MODULES}
     return {
         "user": {
             "id": user["id"],
@@ -82,11 +83,8 @@ def _create_firm_with_owner(firebase_uid: str, email: str, full_name: str, compa
     member = member_res.data[0]
 
     # 4. Create default permissions — all modules ON for user by default
-    permissions_rows = [
-        {"firm_id": firm["id"], "module": module, "user_access": True}
-        for module in ALL_MODULES
-    ]
-    perms_res = supabase.table("firm_permissions").insert(permissions_rows).execute()
+    perm_row = {"firm_id": firm["id"], **{module: True for module in ALL_MODULES}}
+    perms_res = supabase.table("firm_permissions").insert(perm_row).execute()
 
     return _build_auth_response(user, member, firm, perms_res.data)
 
@@ -120,7 +118,7 @@ def _get_auth_response_by_uid(firebase_uid: str) -> dict:
     firm = firm_res.data[0]
 
     perms_res = supabase.table("firm_permissions") \
-        .select("module, user_access") \
+        .select(", ".join(ALL_MODULES)) \
         .eq("firm_id", member["firm_id"]) \
         .execute()
 
@@ -488,7 +486,7 @@ async def accept_invite(body: AcceptInviteRequest):
         firm = firm_res.data[0]
 
         perms_res = supabase.table("firm_permissions") \
-            .select("module, user_access") \
+            .select(", ".join(ALL_MODULES)) \
             .eq("firm_id", invite["firm_id"]) \
             .execute()
 
