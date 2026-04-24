@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.middleware.cors import add_cors
-from app.routers import contact, auth, firm, decks, scoreboard, cohorts, pipeline, portfolio
+from app.routers import contact, auth, firm, decks, scoreboard, cohorts, pipeline, portfolio, dashboard
+from app.routers import settings as settings_router
 from app.config import settings
 
 is_dev = settings.ENVIRONMENT == "development"
@@ -21,6 +22,8 @@ app.include_router(scoreboard.router, prefix="/api")
 app.include_router(cohorts.router, prefix="/api")
 app.include_router(pipeline.router, prefix="/api")
 app.include_router(portfolio.router, prefix="/api")
+app.include_router(settings_router.router, prefix="/api")
+app.include_router(dashboard.router, prefix="/api")
 
 @app.get("/health")
 async def health():
