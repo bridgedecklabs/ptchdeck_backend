@@ -1,7 +1,13 @@
+import secrets
+from datetime import datetime, timezone, timedelta
+
 from fastapi import APIRouter, HTTPException, Depends
 from app.services.supabase_client import supabase
 from app.middleware.auth import admin_and_above, owner_only
+from app.services.email_service import send_invite_email
 from pydantic import BaseModel
+
+INVITE_EXPIRE_HOURS = 48
 
 router = APIRouter()
 
@@ -164,6 +170,86 @@ async def remove_member(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to remove member: {str(e)}")
+
+
+# ─── Resend invite ─────────────────────────────────────────────
+
+@router.post("/firm/members/invite/{member_id}/resend")
+async def resend_invite(
+    member_id: str,
+    ctx=Depends(admin_and_above),
+):
+    firm_id = ctx["firm"]["id"]
+
+    try:
+        res = (
+            supabase.table("firm_members")
+            .select("id, invite_email")
+            .eq("id", member_id)
+            .eq("firm_id", firm_id)
+            .eq("status", "pending")
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Pending invite not found")
+
+    invite_email = res.data[0]["invite_email"]
+    new_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=INVITE_EXPIRE_HOURS)
+
+    try:
+        supabase.table("firm_members").update({
+            "invite_token": new_token,
+            "invite_expires_at": expires_at.isoformat(),
+        }).eq("id", member_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update invite: {str(e)}")
+
+    try:
+        send_invite_email(invite_email, new_token, ctx["firm"]["name"])
+    except Exception as e:
+        print(f"Resend invite email failed (token updated): {e}")
+
+    return {"success": True, "message": "Invite resent"}
+
+
+# ─── Cancel invite ─────────────────────────────────────────────
+
+@router.delete("/firm/members/invite/{member_id}")
+async def cancel_invite(
+    member_id: str,
+    ctx=Depends(admin_and_above),
+):
+    firm_id = ctx["firm"]["id"]
+
+    try:
+        res = (
+            supabase.table("firm_members")
+            .select("id")
+            .eq("id", member_id)
+            .eq("firm_id", firm_id)
+            .eq("status", "pending")
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Pending invite not found")
+
+    try:
+        supabase.table("firm_members").update({
+            "status": "cancelled",
+            "invite_token": None,
+            "invite_expires_at": None,
+        }).eq("id", member_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to cancel invite: {str(e)}")
+
+    return {"success": True, "message": "Invite cancelled"}
 
 
 # ─── Get firm permissions ──────────────────────────────────────
